@@ -1669,7 +1669,7 @@ config_namespace! {
         /// pre <https://github.com/apache/datafusion/pull/21240>
         /// behavior, which silently produces incorrect results for
         /// multi-row subqueries and does not support scalar subqueries in
-        /// ORDER BY / JOIN ON / aggregate-function arguments. This option is
+        /// ORDER BY / JOIN ON. This option is
         /// intended as a temporary escape hatch for distributed execution
         /// frameworks and is planned to be removed in a future DataFusion
         /// release.

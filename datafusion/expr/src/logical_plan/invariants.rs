@@ -198,25 +198,11 @@ pub fn check_subquery_expr(
             match outer_plan {
                 LogicalPlan::Projection(_)
                 | LogicalPlan::Filter(_)
+                | LogicalPlan::Aggregate(_)
                 | LogicalPlan::Dml(DmlStatement {
                     op: WriteOp::MergeInto(_),
                     ..
                 }) => Ok(()),
-                LogicalPlan::Aggregate(Aggregate {
-                    group_expr,
-                    aggr_expr,
-                    ..
-                }) => {
-                    if group_expr.contains(expr) && !aggr_expr.contains(expr) {
-                        // TODO revisit this validation logic
-                        plan_err!(
-                            "Correlated scalar subquery in the GROUP BY clause must \
-                            also be in the aggregate expressions"
-                        )
-                    } else {
-                        Ok(())
-                    }
-                }
                 _ => plan_err!(
                     "Correlated scalar subquery can only be used in Projection, \
                     Filter, Aggregate and MERGE DML plan nodes"

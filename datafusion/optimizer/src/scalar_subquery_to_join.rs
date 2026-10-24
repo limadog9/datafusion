@@ -23,6 +23,7 @@ use std::sync::Arc;
 use crate::decorrelate::{
     PullUpCorrelatedExpr, UN_MATCHED_ROW_INDICATOR, build_join_filter,
 };
+use crate::extract_aggregate_subqueries::extract_aggregate_subqueries;
 use crate::optimizer::ApplyOrder;
 use crate::utils::evaluates_to_null;
 use crate::{OptimizerConfig, OptimizerRule};
@@ -232,6 +233,15 @@ impl OptimizerRule for ScalarSubqueryToJoin {
                 Ok(Transformed::yes(new_plan))
             }
 
+            LogicalPlan::Aggregate(aggregate) => {
+                let physical_uncorrelated = config
+                    .options()
+                    .optimizer
+                    .enable_physical_uncorrelated_scalar_subquery;
+                extract_aggregate_subqueries(aggregate, config, |expr| {
+                    contains_scalar_subquery_to_rewrite(expr, physical_uncorrelated)
+                })
+            }
             plan => Ok(Transformed::no(plan)),
         }
     }

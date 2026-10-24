@@ -1,0 +1,235 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Regression for https://github.com/apache/datafusion/issues/26704.
+# Aggregate inputs are evaluated per row, including subqueries in grouping
+# keys, arguments, filters, and ordering expressions.
+statement ok
+CREATE TABLE t1 (a INT, b VARCHAR, x INT) AS VALUES
+  (1, 'p', 10), (2, 'p', 20), (3, 'q', 30), (NULL, 'q', 40), (2, 'q', 50);
+
+statement ok
+CREATE TABLE t2 (a INT, y INT) AS VALUES (2, 7), (2, 9), (3, 5), (NULL, 1);
+
+query I
+SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a)) AS n FROM t1;
+----
+3
+
+query TI
+SELECT CASE WHEN EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a) THEN 'yes' ELSE 'no' END AS has_t2, count(*) AS n
+FROM t1 GROUP BY 1 ORDER BY 1;
+----
+no 2
+yes 3
+
+query I
+SELECT sum(CASE WHEN t1.a IN (SELECT a FROM t2) THEN t1.x ELSE 0 END) AS s FROM t1;
+----
+100
+
+query TI
+SELECT t1.b, sum((SELECT max(t2.y) FROM t2 WHERE t2.a = t1.a)) AS s
+FROM t1 GROUP BY t1.b ORDER BY t1.b;
+----
+p 9
+q 14
+
+# The NULL in t2 makes NOT IN unknown for non-matching outer rows.
+query I
+SELECT count(*) FILTER (WHERE t1.a NOT IN (SELECT a FROM t2)) AS n FROM t1;
+----
+0
+
+query IIIII
+SELECT count(*),
+       count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a)),
+       count(*) FILTER (WHERE (a IN (SELECT a FROM t2)) IS TRUE),
+       count(*) FILTER (WHERE (a IN (SELECT a FROM t2)) IS FALSE),
+       count(*) FILTER (WHERE (a IN (SELECT a FROM t2)) IS UNKNOWN)
+FROM t1;
+----
+5 2 3 0 2
+
+# DISTINCT must still apply after evaluating the subquery for each input row.
+query II
+SELECT count(DISTINCT CASE WHEN EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a) THEN a END),
+       sum(DISTINCT (SELECT max(y) FROM t2 WHERE t2.a = t1.a))
+FROM t1;
+----
+2 14
+
+query T
+SELECT string_agg(b, ',' ORDER BY EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a), x)
+FROM t1;
+----
+p,q,p,q,q
+
+# Both aggregate and group-key output names must remain available to parents.
+query TI
+SELECT b, sum((SELECT max(y) FROM t2 WHERE t2.a = t1.a)) AS s
+FROM t1 GROUP BY b
+HAVING sum((SELECT max(y) FROM t2 WHERE t2.a = t1.a)) > 10
+ORDER BY b;
+----
+q 14
+
+query II
+SELECT (SELECT max(y) FROM t2 WHERE t2.a = t1.a) AS m, count(*) AS n
+FROM t1 GROUP BY 1 ORDER BY 1 NULLS FIRST;
+----
+NULL 2
+5 1
+9 2
+
+query BI
+SELECT a IN (SELECT a FROM t2) AS matched, count(*)
+FROM t1 GROUP BY 1 ORDER BY 1 NULLS FIRST;
+----
+NULL 2
+true 3
+
+# Grouping sets with ordinary keys can also have subqueries in aggregates.
+query TI
+SELECT b, count(*) FILTER (WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a))
+FROM t1 GROUP BY GROUPING SETS ((b), ()) ORDER BY b NULLS LAST;
+----
+p 1
+q 2
+NULL 3
+
+# An aggregate containing subqueries can itself be a correlated subquery.
+query TI
+SELECT o.b,
+       (SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = i.a))
+        FROM t1 AS i WHERE i.b = o.b) AS n
+FROM (VALUES ('p'), ('q'), ('z')) AS o(b) ORDER BY o.b;
+----
+p 1
+q 2
+z 0
+
+# The default physical path for uncorrelated scalar subqueries stays usable.
+query I
+SELECT sum((SELECT max(y) FROM t2)) FROM t1;
+----
+45
+
+statement ok
+set datafusion.optimizer.enable_physical_uncorrelated_scalar_subquery = false;
+
+query I
+SELECT sum((SELECT max(y) FROM t2)) FROM t1;
+----
+45
+
+statement ok
+set datafusion.optimizer.enable_physical_uncorrelated_scalar_subquery = true;
+
+query II
+SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a)),
+       sum((SELECT max(y) FROM t2 WHERE t2.a = t1.a))
+FROM t1 WHERE false;
+----
+0 NULL
+
+statement ok
+CREATE TABLE empty_t2 AS SELECT * FROM t2 WHERE false;
+
+query IIII
+SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM empty_t2)),
+       count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM empty_t2)),
+       count(*) FILTER (WHERE a NOT IN (SELECT a FROM empty_t2)),
+       count(*) FILTER (WHERE (a IN (SELECT a FROM empty_t2)) IS UNKNOWN)
+FROM t1;
+----
+0 5 5 0
+
+# Generated extraction columns must not hide an existing input column.
+statement ok
+CREATE TABLE collision (__aggregate_subquery_1 INT, a INT) AS VALUES (100, 2), (200, 1);
+
+query I
+SELECT sum(__aggregate_subquery_1 + CASE WHEN EXISTS (SELECT 1 FROM t2 WHERE t2.a = collision.a) THEN 1 ELSE 0 END)
+FROM collision;
+----
+301
+
+# Scalar subqueries also work in aggregate filters and ordering expressions.
+query I
+SELECT count(*) FILTER (WHERE (SELECT max(y) FROM t2 WHERE t2.a = t1.a) > 5)
+FROM t1;
+----
+2
+
+query T
+SELECT string_agg(b, ',' ORDER BY (SELECT max(y) FROM t2 WHERE t2.a = t1.a) NULLS LAST, x)
+FROM t1;
+----
+q,p,q,p,q
+
+# An unmatched correlated count contributes zero, rather than a NULL value.
+query II
+SELECT count((SELECT count(*) FROM t2 WHERE t2.a = t1.a)),
+       sum((SELECT count(*) FROM t2 WHERE t2.a = t1.a))
+FROM t1;
+----
+5 5
+
+# Predicate and scalar rewrites can cooperate on one aggregate argument.
+query I
+SELECT sum(CASE WHEN EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a)
+                THEN (SELECT max(y) FROM t2 WHERE t2.a = t1.a) ELSE 0 END)
+FROM t1;
+----
+23
+
+# Newly inserted projections are visited in the same optimizer pass.
+statement ok
+set datafusion.optimizer.max_passes = 1;
+
+query TII
+SELECT CASE WHEN EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a) THEN 'yes' ELSE 'no' END AS matched,
+       sum((SELECT max(y) FROM t2 WHERE t2.a = t1.a)),
+       count(*) FILTER (WHERE a IN (SELECT a FROM t2))
+FROM t1 GROUP BY 1 ORDER BY 1;
+----
+no NULL 0
+yes 23 3
+
+statement ok
+set datafusion.optimizer.max_passes = 3;
+
+# Moving scalar subqueries does not relax their single-row requirement.
+statement error Correlated scalar subquery must be aggregated to return at most one row
+SELECT sum((SELECT y FROM t2 WHERE t2.a = t1.a)) FROM t1;
+
+# Repeated grouping keys keep the same grouping and output names.
+query TI
+SELECT CASE WHEN EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a) THEN 'yes' ELSE 'no' END AS matched,
+       count(*)
+FROM t1 GROUP BY 1, 1 ORDER BY 1;
+----
+no 2
+yes 3
+
+query I
+SELECT sum((SELECT max(y) FROM t2 WHERE t2.a = t1.a) +
+           (SELECT min(y) FROM t2 WHERE t2.a = t1.a))
+FROM t1;
+----
+42

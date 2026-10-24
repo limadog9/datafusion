@@ -24,6 +24,7 @@ use crate::analyzer::type_coercion::TypeCoercionRewriter;
 use crate::decorrelate::{
     PullUpCorrelatedExpr, UN_MATCHED_ROW_INDICATOR, build_join_filter,
 };
+use crate::extract_aggregate_subqueries::extract_aggregate_subqueries;
 use crate::extract_equijoin_predicate::split_eq_and_noneq_join_predicate;
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
@@ -66,11 +67,19 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
         plan: LogicalPlan,
         config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
+        let mut has_subqueries = false;
         let plan = plan
             .map_subqueries(|subquery| {
+                has_subqueries = true;
                 subquery.transform_down(|p| self.rewrite(p, config))
             })?
             .data;
+
+        // Reuse that traversal instead of scanning ordinary aggregate and
+        // projection expressions a second time.
+        if !has_subqueries {
+            return Ok(Transformed::no(plan));
+        }
 
         if let LogicalPlan::Projection(projection) = plan {
             if !projection.expr.iter().any(has_subquery) {
@@ -103,8 +112,12 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
             return Ok(Transformed::yes(new_plan));
         }
 
-        let LogicalPlan::Filter(filter) = plan else {
-            return Ok(Transformed::no(plan));
+        let filter = match plan {
+            LogicalPlan::Filter(filter) => filter,
+            LogicalPlan::Aggregate(aggregate) => {
+                return extract_aggregate_subqueries(aggregate, config, has_subquery);
+            }
+            plan => return Ok(Transformed::no(plan)),
         };
 
         if !has_subquery(&filter.predicate) {
