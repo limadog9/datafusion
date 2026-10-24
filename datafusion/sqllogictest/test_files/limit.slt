@@ -1257,3 +1257,96 @@ physical_plan
 
 statement ok
 DROP TABLE t22489;
+
+# Regression for https://github.com/apache/datafusion/issues/26690.
+# Replacing a sort with an ordered merge below OFFSET must retain enough
+# input rows for both the skipped rows and the outer LIMIT.
+statement ok
+set datafusion.execution.target_partitions = 4;
+
+statement ok
+COPY (SELECT value AS a FROM generate_series(1, 20) ORDER BY a)
+TO 'test_files/scratch/limit/sorted_offset/p1.parquet' STORED AS PARQUET;
+
+statement ok
+COPY (SELECT value AS a FROM generate_series(21, 40) ORDER BY a)
+TO 'test_files/scratch/limit/sorted_offset/p2.parquet' STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE sorted_offset (a BIGINT)
+STORED AS PARQUET
+WITH ORDER (a ASC)
+LOCATION 'test_files/scratch/limit/sorted_offset/';
+
+# The ordered merge retains skip + fetch rows, preserving the sort elimination.
+query TT
+EXPLAIN SELECT * FROM (SELECT * FROM sorted_offset OFFSET 5)
+ORDER BY a LIMIT 10;
+----
+logical_plan
+<slt:ignore>
+physical_plan
+01)GlobalLimitExec: skip=5, fetch=10
+02)--SortPreservingMergeExec: [a@0 ASC NULLS LAST], fetch=15
+03)----DataSourceExec: <slt:ignore>
+
+# The subqueries without ORDER BY can skip arbitrary rows; their cardinality
+# must still be independent of the number of execution partitions.
+query TI rowsort
+SELECT 'offset', count(*) FROM (
+  SELECT * FROM (SELECT * FROM sorted_offset OFFSET 5) ORDER BY a LIMIT 10
+) WHERE a > 0
+UNION ALL
+SELECT 'limit_offset', count(*) FROM (
+  SELECT * FROM (SELECT * FROM sorted_offset LIMIT 30 OFFSET 15) ORDER BY a LIMIT 10
+) WHERE a > 0
+UNION ALL
+SELECT 'inner_limit', count(*) FROM (
+  SELECT * FROM (SELECT * FROM sorted_offset LIMIT 3 OFFSET 5) ORDER BY a LIMIT 10
+) WHERE a > 0
+UNION ALL
+SELECT 'short_input', count(*) FROM (
+  SELECT * FROM (SELECT * FROM sorted_offset OFFSET 35) ORDER BY a LIMIT 10
+) WHERE a > 0
+UNION ALL
+SELECT 'zero_offset', count(*) FROM (
+  SELECT * FROM (SELECT * FROM sorted_offset OFFSET 0) ORDER BY a LIMIT 10
+) WHERE a > 0;
+----
+inner_limit 3
+limit_offset 10
+offset 10
+short_input 5
+zero_offset 10
+
+# With an inner ordering, check the selected values as well as their count.
+query I
+SELECT a FROM (SELECT * FROM sorted_offset ORDER BY a OFFSET 5)
+ORDER BY a LIMIT 10;
+----
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+
+statement ok
+set datafusion.execution.target_partitions = 1;
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM (SELECT * FROM sorted_offset OFFSET 5) ORDER BY a LIMIT 10
+) WHERE a > 0;
+----
+10
+
+statement ok
+set datafusion.execution.target_partitions = 4;
+
+statement ok
+DROP TABLE sorted_offset;

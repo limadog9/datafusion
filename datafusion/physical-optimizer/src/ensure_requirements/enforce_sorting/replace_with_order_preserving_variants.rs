@@ -31,6 +31,7 @@ use datafusion_common::tree_node::Transformed;
 use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::execution_plan::EmissionType;
+use datafusion_physical_plan::limit::GlobalLimitExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::tree_node::PlanContext;
@@ -110,6 +111,14 @@ pub fn plan_with_order_preserving_variants(
         sort_input.data = false;
         return Ok(sort_input);
     }
+    // A fetch bounds this node's output, so an OFFSET needs additional input
+    // rows before that bound can be applied to an ordered merge below it.
+    let child_fetch =
+        if let Some(limit) = sort_input.plan.downcast_ref::<GlobalLimitExec>() {
+            fetch.map(|fetch| fetch.saturating_add(limit.skip()))
+        } else {
+            fetch
+        };
     sort_input.children = sort_input
         .children
         .into_iter()
@@ -120,7 +129,7 @@ pub fn plan_with_order_preserving_variants(
                     node,
                     is_spr_better,
                     is_spm_better,
-                    fetch,
+                    child_fetch,
                 )
             } else {
                 Ok(node)
